@@ -1,0 +1,21 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# Virtual env
+.venv/
+venv/
+
+# Environment variables
+.env
+.env.*
+
+# Chroma vector DB
+chroma_db/
+
+# Data PDFs
+data/pdfs/
+
+# OS files
+.DS_Store
+Thumbs.db
