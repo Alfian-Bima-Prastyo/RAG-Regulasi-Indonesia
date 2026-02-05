@@ -24,7 +24,6 @@ Alur sistem secara garis besar:
 ## Teknologi yang Digunakan
 
 - **Python**
-- **FastAPI** – API server
 - **LangChain** – RAG pipeline
 - **ChromaDB** – Vector database
 - **Deepseek-r1**
