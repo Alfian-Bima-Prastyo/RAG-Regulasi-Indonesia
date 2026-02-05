@@ -89,6 +89,17 @@ class AdvancedReranker:
                     score -= penalty
                     explanations.append(f"Perbedaan tahun ({source_year} vs {query_year}): -{penalty:.1f}")
 
+
+        if any(term in query_lower for term in ['ojk', 'otoritas jasa keuangan', 'tugas ojk', 'wewenang ojk']):
+            if 'UU_21_2011' in source:
+                score += 250 
+                explanations.append("Query tentang OJK + UU OJK: +250")
+        
+        if any(term in query_lower for term in ['manajemen risiko teknologi', 'manajemen risiko ti', 'teknologi informasi']):
+            if 'POJK_11_2022' in source:
+                score += 250
+                explanations.append("Query tentang Risiko TI + POJK 11/2022: +250")
+
         query_reg = self._extract_regulation_from_query(query)
         if query_reg and source != "unknown":
             source_reg = re.sub(r'_\d{4}\.pdf', '', source).replace('_', ' ')
@@ -96,7 +107,7 @@ class AdvancedReranker:
                 score += 500
                 explanations.append(f"Nama regulasi match ({query_reg}): +200")
             else:
-                score -= 50   # Penalty for wrong document
+                score -= 50 
                 explanations.append(f"Document mismatch: -50")
 
         important_terms = [

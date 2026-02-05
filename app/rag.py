@@ -6,6 +6,7 @@ import re
 from app.loaders import load_pdfs_with_metadata
 from app.retriever import HybridRetriever
 from app.reranker import AdvancedReranker
+from app.strict_context import StrictRegulationContextBuilder
 from app.prompt import ADVANCED_PROMPT_TEMPLATE
 from app.config import CHROMA_DIR, PDF_DIR, TOP_K
 
@@ -26,6 +27,7 @@ docs = load_pdfs_with_metadata(PDF_DIR)
 
 # Initialize components
 reranker = AdvancedReranker()
+context_builder = StrictRegulationContextBuilder()
 retriever = HybridRetriever(vectorstore, docs, k=TOP_K)
 
 # Initialize LLM
@@ -109,80 +111,169 @@ def extract_snippet(doc, query):
     
     return snippet
 
-def ask(question):
+
+def ask(question: str):
+    print("\n=== DEBUG ASK ===")
+    print("Query:", question)
+
+    # 1. REGULATION PARSER
+    REGEX = r'(pojk|seojk|uu)\s*(?:no\.|nomor)?\s*(\d+)\s*(?:tahun|/)?\s*(\d{4})'
+    query_match = re.search(REGEX, question, re.IGNORECASE)
+
+    if not query_match:
+        return {
+            "answer": "Pertanyaan tidak menyebut regulasi secara eksplisit.",
+            "sources": [],
+            "confidence": {"overall": 0.0},
+            "num_sources": 0,
+            "validation_status": {
+                "valid": False,
+                "error": "No explicit regulation reference"
+            }
+        }
+
+    reg_type, reg_num, reg_year = query_match.groups()
+    reg_type = reg_type.upper()
+    reg_num = str(int(reg_num))  
+    expected_filename = f"{reg_type}_{reg_num}_{reg_year}"
+
+    print("\n=== DEBUG REGULATION PARSED ===")
+    print("Type :", reg_type)
+    print("Num  :", reg_num)
+    print("Year :", reg_year)
+    print("Expect:", expected_filename)
+
+    # 2. RETRIEVAL
     retrieved = retriever.retrieve(question)
-    
+
+    print("\n=== DEBUG RETRIEVER RAW ===")
+    for i, doc in enumerate(retrieved[:10], 1):
+        print(f"{i}. {doc.metadata.get('source')} | page={doc.metadata.get('page')}")
+
+    # 3. RERANK
     reranked = reranker.rerank(retrieved, query=question)
-    
-    selected_docs = reranked[:TOP_K]
 
-    query_pattern = r'(POJK|SEOJK|UU)\s*(\d+)[/\s]*(20\d{2})'
-    query_match = re.search(query_pattern, question.upper())
-    
-    warning = ""
-    if query_match:
-        query_reg = query_match.group(0).replace(' ', '_').replace('/', '_')
-        doc_found = any(
-            query_reg in doc.metadata.get('source', '').upper() 
-            for doc, _ in selected_docs[:3]
-        )
-        
-        if not doc_found:
-            warning = f"⚠️ Dokumen {query_match.group(0)} tidak ditemukan dalam sistem.\n\n"
+    print("\n=== DEBUG RERANKED ===")
+    for i, (doc, score) in enumerate(reranked[:10], 1):
+        print(f"{i}. {doc.metadata.get('source')} | score={score:.2f}")
 
-    if 'seojk' in question.lower():
-        has_seojk = any('SEOJK' in doc.metadata.get('source', '').upper() 
-                    for doc, _ in selected_docs[:3])
-        if not has_seojk:
-            warning = "⚠️ SEOJK spesifik tidak ditemukan. Menggunakan POJK terkait.\n\n"
-    elif 'pojk' in question.lower():
-        has_pojk = any('POJK' in doc.metadata.get('source', '').upper() 
-                    for doc, _ in selected_docs[:3])
-        if not has_pojk:
-            warning = "⚠️ POJK spesifik tidak ditemukan. Menggunakan regulasi terkait.\n\n"
-    elif 'uu' in question.lower() or 'undang-undang' in question.lower():
-        has_uu = any('UU' in doc.metadata.get('source', '').upper() 
-                    for doc, _ in selected_docs[:3])
-        if not has_uu:
-            warning = "⚠️ UU spesifik tidak ditemukan. Menggunakan regulasi terkait.\n\n"
-    
-    confidence_info = calculate_confidence(selected_docs, question)
-    
-    context_chunks = []
+    # 4. STRICT REGULATION LOCK
+    locked_docs = [
+        (doc, score)
+        for doc, score in reranked
+        if expected_filename in doc.metadata.get("source", "").upper()
+    ]
+
+    if not locked_docs:
+        return {
+            "answer": f" Dokumen {reg_type} {reg_num} Tahun {reg_year} tidak tersedia di sistem.",
+            "sources": [],
+            "confidence": {"overall": 0.0},
+            "num_sources": 0,
+            "validation_status": {
+                "valid": False,
+                "error": "Regulation not found"
+            }
+        }
+
+    print("\n=== DEBUG LOCKED DOCS ===")
+    for i, (doc, score) in enumerate(locked_docs[:5], 1):
+        print(f"{i}. {doc.metadata.get('source')} | page={doc.metadata.get('page')} | score={score:.1f}")
+
+    # 5. AUTO SPLIT(Definition)
+    q = question.lower()
+    is_definition = any(k in q for k in [
+        "apa yang dimaksud",
+        "apa itu",
+        "pengertian"
+    ])
+
+    if is_definition:
+        selected_docs = [
+            (doc, score)
+            for doc, score in locked_docs
+            if doc.metadata.get("page") in [0, 1]
+        ][:2]
+    else:
+        selected_docs = locked_docs[:5]
+
+    print("\n=== DEBUG AUTO SPLIT ===")
+    print("Definition mode:", is_definition)
+    for i, (doc, score) in enumerate(selected_docs, 1):
+        print(f"{i}. {doc.metadata.get('source')} | page={doc.metadata.get('page')}")
+
+    # 6. CONTEXT BUILDER (STRICT)
+    context = "## DOKUMEN YANG TERSEDIA DI SISTEM (STRICT REGULATION MODE)\n\n"
+    context += " HANYA dokumen berikut yang BOLEH digunakan.\n\n"
+
     sources = []
-    
-    for doc, score in selected_docs:
-        source = doc.metadata.get("source", "unknown")
-        page = doc.metadata.get("page", "N/A")
-        
-        context_chunks.append(
-            f"[Sumber: {source}, Halaman: {page}, Score: {score:.1f}]\n{doc.page_content}"
-        )
-        
-        snippet = extract_snippet(doc, question)
-        
+
+    for i, (doc, score) in enumerate(selected_docs, 1):
+        context += f"### DOKUMEN #{i}: {doc.metadata.get('source')}\n"
+        context += f" Halaman: {doc.metadata.get('page')}\n"
+        context += f" Relevance Score: {score:.1f}\n\n"
+        context += f"{doc.page_content}\n\n"
+        context += "=" * 80 + "\n\n"
+
         sources.append({
-            "document": source,
-            "page": page,
-            "score": score,
-            "snippet": snippet
+            "document": doc.metadata.get("source"),
+            "page": doc.metadata.get("page"),
+            "score": score
         })
-    
-    context = "\n\n".join(context_chunks)
-    
+
+    print("\n=== DEBUG FULL CONTEXT SENT TO LLM ===")
+    print(context[:3000])
+
+    # 7. PROMPT & LLM
     prompt = ADVANCED_PROMPT_TEMPLATE.format(
         context=context,
         question=question
     )
-    
+
     answer = llm.invoke(prompt)
-    
+    answer_text = str(answer)
+
+    # 8. POST VALIDATION
+    validation = validate_citations(answer_text, selected_docs)
+
+    if not validation["valid"]:
+        answer_text = f" PERINGATAN SISTEM: {validation['error']}\n\n" + answer_text
+
+    confidence_info = calculate_confidence(selected_docs, question)
+
     return {
-        "answer": warning + answer,
+        "answer": answer_text,
         "sources": sources,
         "confidence": confidence_info,
-        "num_sources": len(selected_docs)
+        "num_sources": len(selected_docs),
+        "validation_status": validation
     }
+
 
 def get_stats():
     return reranker.get_report()
+
+def validate_citations(answer, source_docs):
+    available_docs = [doc.metadata.get('source', '').upper() for doc, _ in source_docs]
+    
+    pattern = r'(UU|POJK|SEOJK)[\s_]*(?:No\.|Nomor)?\s*(\d+)[\s_/]*(?:Tahun\s*)?(\d{4})'
+
+    mentioned = re.findall(pattern, answer, re.IGNORECASE)
+    
+    hallucinations = []
+    
+    for reg_type, num, year in mentioned:
+        expected_file = f"{reg_type.upper()}_{num}_{year}.PDF"
+        
+        found = any(expected_file in doc for doc in available_docs)
+        
+        if not found:
+            hallucinations.append(f"{reg_type} {num}/{year}")
+    
+    if hallucinations:
+        return {
+            'valid': False,
+            'error': f"Jawaban menyebut dokumen yang tidak tersedia: {', '.join(hallucinations)}"
+        }
+    
+    return {'valid': True, 'error': None}
